@@ -7,7 +7,7 @@ auth_tokens.json
 
 # Environment/Secrets
 .env
-
+.agent
 # Logs
 *.log
 bot.log
