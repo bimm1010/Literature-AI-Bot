@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+auth_tokens.json
+
+# Environment/Secrets
+.env
+
+# Logs
+*.log
+bot.log
+
+# Temporary Files
+temp_images/
+*.tmp
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+.gemini/
+.agent/
+brain/
+*.md
+!README.md
+!DEPLOY.md
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.env/
+/Volumes/MacEx/
