@@ -1,27 +1,73 @@
+from typing import List, Dict, Optional
 import config
-import os
-import uuid
-import asyncio
-import asyncio.subprocess
 import logging
-import google.generativeai as genai
+import time
+import asyncio
+import threading
+import io
+import re
+from PIL import Image
+from google import genai
+from google.genai import types
 
-# Lấy đường dẫn CLI từ config (mặc định là "gemini")
-# Khuyến khích Đại ca dùng đường dẫn tuyệt đối trong .env 
-GEMINI_BIN = config.GEMINI_CLI_COMMAND
+# ─────────────────────────────────────────────
+# Key Rotator: Round-Robin + Auto-Skip on 429
+# ─────────────────────────────────────────────
 
-SYSTEM_INSTRUCTIONS = """
-Bạn là một trợ lý ảo chuyên nghiệp giúp giáo viên chấm bài văn của học sinh. 
+class KeyRotator:
+    """Thread-safe round-robin key rotation with cooldown tracking."""
+
+    def __init__(self, api_keys: List[str]):
+        self._keys = api_keys
+        self._index = 0
+        self._lock = threading.Lock()
+        self._cooldowns: Dict[str, float] = {}
+
+    @property
+    def total_keys(self) -> int:
+        return len(self._keys)
+
+    def get_next_key(self) -> Optional[str]:
+        """Get next available key (skips keys in cooldown)."""
+        with self._lock:
+            now = time.time()
+            for _ in range(len(self._keys)):
+                key = self._keys[self._index]
+                self._index = (self._index + 1) % len(self._keys)
+                if now >= self._cooldowns.get(key, 0):
+                    return key
+            soonest_key = min(self._keys, key=lambda k: self._cooldowns.get(k, 0))
+            return soonest_key
+
+    def mark_cooldown(self, key: str, duration: float = 60.0):
+        with self._lock:
+            self._cooldowns[key] = time.time() + duration
+            logging.warning(f"🔑 Key ...{key[-6:]} cooldown {duration:.0f}s")
+
+    def get_wait_time(self) -> float:
+        with self._lock:
+            now = time.time()
+            soonest = min(self._cooldowns.get(k, 0) for k in self._keys)
+            return max(0.0, soonest - now)
+
+
+_rotator = KeyRotator(config.GEMINI_API_KEYS) if config.GEMINI_API_KEYS else None
+
+# ─────────────────────────────────────────────
+# System Instruction (tách riêng để Gemini cache)
+# ─────────────────────────────────────────────
+
+SYSTEM_INSTRUCTION = """Bạn là một trợ lý ảo chuyên nghiệp giúp giáo viên chấm bài văn của học sinh.
 Hãy phân tích hình ảnh bài làm và phản hồi theo định dạng sau (sử dụng icon sinh động):
 
 🏆 **TỔNG ĐIỂM:** [Điểm]/10
 
-📝 **NHẬN XÉT CHUNG:** 
+📝 **NHẬN XÉT CHUNG:**
 [Tóm tắt ưu nhược điểm chính của bài làm]
 
 🛠 **CHI TIẾT CÁC LỖI CẦN LƯU Ý:**
-- ❌ **Chính tả:** [Từ sai] ➡ [Từ đúng] (giải thích ngắn gọn nếu cần)
-- 💡 **Cách hành văn:** "[Cụm từ/Câu chưa hay]" ➡ "[Gợi ý sửa lại cho hay hơn]"
+- ❌ **Chính tả:** [Từ sai] ➡ [Từ đúng]
+- 💡 **Cách hành văn:** "[Câu chưa hay]" ➡ "[Gợi ý sửa]"
 - 📍 **Ngữ pháp/Dấu câu:** [Lỗi nếu có]
 
 ✨ **ƯU ĐIỂM:**
@@ -30,187 +76,146 @@ Hãy phân tích hình ảnh bài làm và phản hồi theo định dạng sau 
 🚀 **GÓP Ý CẢI THIỆN:**
 - [Lời khuyên để học sinh làm tốt hơn lần sau]
 
-Lưu ý: Luôn phản hồi bằng tiếng Việt chân thành, khích lệ nhưng vẫn công tâm và chính xác.
-Dưới đây là yêu cầu cụ thể của giáo viên:
-"""
+Luôn phản hồi bằng tiếng Việt chân thành, khích lệ nhưng công tâm và chính xác."""
 
-OCR_PROMPT = """
-Bạn là một hệ thống Trích xuất Văn bản (OCR) siêu việt. 
-Nhiệm vụ của bạn là bóc tách toàn bộ chữ viết tay của học sinh trong các bức ảnh bài thi này.
-Yêu cầu:
-1. Trích xuất CHÍNH XÁC đến từng chữ, sai chính tả ghi nguyên văn chữ sai.
-2. KHÔNG bình luận, KHÔNG sửa lỗi, KHÔNG thêm bớt bất cứ chữ nào.
-3. Chỉ trả về kết quả là phần chữ đọc được, định dạng y hệt như học sinh viết (xuống dòng, thụt lề).
-"""
 
-_current_key_idx = 0
-_current_model_idx = 0
+# ─────────────────────────────────────────────
+# Image Optimization
+# ─────────────────────────────────────────────
 
-FALLBACK_MODELS = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-]
+MAX_IMAGE_DIMENSION = 1024  # px — đủ cho OCR chữ viết tay
 
-async def extract_text_via_sdk(image_list: list[bytes]) -> str:
-    """Bước 1: Mắt thần đọc chữ từ ảnh (SDK) với cơ chế đảo Key vòng lặp và đổi Model."""
-    global _current_key_idx, _current_model_idx
-    keys = config.GEMINI_API_KEYS
-    if not keys:
-        raise Exception("Không có API key nào được cấu hình trong GEMINI_API_KEYS")
-        
-    parts = [OCR_PROMPT]
-    for img_bytes in image_list:
-        parts.append({
-            "mime_type": "image/jpeg",
-            "data": img_bytes
-        })
 
-    max_attempts = len(keys) * len(FALLBACK_MODELS)
-    attempts = 0
-    
-    while attempts < max_attempts:
-        api_key = keys[_current_key_idx]
-        model_name = FALLBACK_MODELS[_current_model_idx]
-        
-        logging.info(f"🔄 Đang bóc chữ (OCR) với model {model_name} (Key Index: {_current_key_idx + 1}/{len(keys)})")
-        genai.configure(api_key=api_key)
-        
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = await asyncio.to_thread(model.generate_content, parts)
-            
-            if response.text:
-                logging.info(f"✅ OCR bóc chữ thành công!")
-                return response.text.strip()
-            else:
-                raise Exception("Phản hồi bóc chữ rỗng từ API")
-                
-        except Exception as e:
-            logging.warning(f"⚠️ Lỗi OCR (Key {_current_key_idx}, Model {model_name}): {e}")
-            attempts += 1
-            
-            _current_model_idx = (_current_model_idx + 1) % len(FALLBACK_MODELS)
-            if _current_model_idx == 0:
-                _current_key_idx = (_current_key_idx + 1) % len(keys)
-                
-            if attempts < max_attempts:
-                await asyncio.sleep(2)
-            
-    raise Exception("❌ Đã thử toàn bộ API Keys và Model nhưng chức năng Đọc chữ (OCR) thất bại!")
-
-async def grade_via_cli(extracted_text: str, user_prompt: str) -> str:
-    """Bước 2: Phân tích bài làm qua CLI (Chỉ đẩy Text, KHÔNG cần up lại ảnh)."""
-    
-    # Text dài quá cần gói vào file tạm cho CLI đọc đỡ bị lỗi quá tải tham số
-    # CLI hỗ trợ đọc từ file text qua stdin hoặc qua một file tạm.
-    # Để an toàn nhất với số lượng text lớn (hàng ngàn chữ), mình lưu file tạm.
-    
-    if not os.path.exists(config.TEMP_IMAGE_DIR):
-        os.makedirs(config.TEMP_IMAGE_DIR)
-        
-    temp_txt_path = os.path.abspath(os.path.join(config.TEMP_IMAGE_DIR, f"{uuid.uuid4()}.txt"))
-    
-    # Nạp cả yêu cầu của hệ thống, giáo viên và nội dung bài làm của học trò
-    full_prompt_content = (
-        f"{SYSTEM_INSTRUCTIONS}\n"
-        f"--- YÊU CẦU CỦA GIÁO VIÊN ---\n{user_prompt}\n\n"
-        f"--- BÀI LÀM CỦA HỌC SINH (TEXT ĐÃ BÓC TÁCH) ---\n{extracted_text}"
-    )
-    
+def _optimize_image(img_bytes: bytes) -> bytes:
+    """Resize ảnh xuống max 1024px và compress JPEG 85% → giảm 60-70% kích thước."""
     try:
-        with open(temp_txt_path, "w", encoding="utf-8") as f:
-            f.write(full_prompt_content)
-            
-        logging.info(f"🚀 Bắt đầu gọi CLI chấm điểm ({GEMINI_BIN}) cho bài làm đã trích xuất...")
-        
-        cmd_args = [GEMINI_BIN]
-        model_name = os.getenv("GEMINI_MODEL")
-        if model_name:
-            cmd_args.extend(["-m", model_name])
-            
-        cmd_args.extend([
-            # Thay vì truyền vào -p, ta dội thẳng cái file text kia là an toàn nhất.
-            "-p", f"Vui lòng đọc yêu cầu và bài làm trong file này: @{temp_txt_path}",
-            "--raw-output",
-            "--accept-raw-output-risk"
-        ])
+        img = Image.open(io.BytesIO(img_bytes))
+        original_size = len(img_bytes)
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd_args,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        try:
-            # 120s là quá đủ cho text (Ảnh nặng mới cần lên tới 300s)
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-        except asyncio.TimeoutError:
-            logging.error("❌ CLI bị timeout sau 120s khi chấm thẻ Text!")
-            try:
-                process.kill()
-            except:
-                pass
-            raise Exception("Chấm bài bằng Text mất quá nhiều thời gian (>120s)")
-        
-        if process.returncode == 0:
-            result = stdout.decode().strip()
-            logging.info("✅ CLI chấm thi qua Text thành công!")
-            clean_result = "\n".join([
-                line for line in result.splitlines() 
-                if "cached credentials" not in line.lower() and "gemini cli" not in line.lower()
-            ]).strip()
-            return clean_result
-        else:
-            error_msg = stderr.decode().strip()
-            logging.error(f"❌ CLI Error: {error_msg}")
-            raise Exception(f"CLI Error: {error_msg}")
-            
-    finally:
-        # Xoá file text tạm
-        if os.path.exists(temp_txt_path):
-            try:
-                os.remove(temp_txt_path)
-            except:
-                pass
+        # Resize nếu ảnh quá lớn
+        if max(img.size) > MAX_IMAGE_DIMENSION:
+            img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.LANCZOS)
 
-async def grade_literature_test(image_list: list[bytes], user_prompt: str) -> str:
-    """Luồng Song kiếm hợp bích: Bước 1 (API Bóc chữ) -> Bước 2 (CLI Chấm bài)"""
-    
-    try:
-        # BƯỚC 1: Bóc toàn bộ chữ từ ảnh thông qua SDK (không sợ lỗi timeout VPS vì có quay vòng)
-        extracted_text = await extract_text_via_sdk(image_list)
-        
-        # BƯỚC 2: Nhồi hết đống text đó vào CLI để tư duy và chấm bài
-        if config.USE_CLI:
-            return await grade_via_cli(extracted_text, user_prompt)
-        else:
-            # Nếu đã tắt CLI ép cứng trong env, thì đành lấy SDK chấm bài học sinh luôn vậy.
-            # (Phòng khi CLI bị đứt cáp gì đó)
-            full_prompt = f"{SYSTEM_INSTRUCTIONS}\n{user_prompt}\n\nDưới đây là bài làm dạng văn bản:\n{extracted_text}"
-            return await grade_via_cli_fallback(extracted_text, user_prompt)
+        # Convert to RGB (loại bỏ alpha channel nếu có)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
 
+        # Compress
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=85, optimize=True)
+        optimized = buffer.getvalue()
+
+        ratio = (1 - len(optimized) / original_size) * 100
+        logging.info(f"📸 Ảnh {original_size // 1024}KB → {len(optimized) // 1024}KB (giảm {ratio:.0f}%)")
+        return optimized
     except Exception as e:
-        logging.error(f"❌ Song kiếm hợp bích gặp trục trặc: {e}")
-        return f"❌ Hệ thống AI đang bận hoặc gặp lỗi cấu hình: {str(e)}"
+        logging.warning(f"⚠️ Không thể optimize ảnh: {e}. Dùng ảnh gốc.")
+        return img_bytes
 
-# Hàm dự phòng "Siêu mỏng" để chấm bằng AI SDK khi CLI chết hẳn
-async def grade_via_cli_fallback(extracted_text: str, user_prompt: str) -> str:
-    # Lấy luôn code cũ SDK sang 1 hàm riêng mini phòng hờ
-    keys = config.GEMINI_API_KEYS
-    full_prompt = (
-        f"{SYSTEM_INSTRUCTIONS}\n"
-        f"--- YÊU CẦU CỦA GIÁO VIÊN ---\n{user_prompt}\n\n"
-        f"--- BÀI LÀM CỦA HỌC SINH (TEXT ĐÃ BÓC TÁCH) ---\n{extracted_text}"
+
+# ─────────────────────────────────────────────
+# Gemini Config: Tắt Thinking Mode cho tốc độ
+# ─────────────────────────────────────────────
+
+def _build_gen_config(model_name: str) -> types.GenerateContentConfig:
+    """Build generation config — tắt thinking cho 2.5 models để tăng tốc."""
+    cfg = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.3,
     )
-    for model_name in FALLBACK_MODELS:
-        for key in keys:
-            genai.configure(api_key=key)
+    # Tắt thinking mode trên gemini-2.5-* (mặc định bật → chậm 3-5x)
+    if "2.5" in model_name:
+        cfg.thinking_config = types.ThinkingConfig(thinking_budget=0)
+    return cfg
+
+
+# ─────────────────────────────────────────────
+# Main Grading Function
+# ─────────────────────────────────────────────
+
+async def grade_literature_test(image_list: List[bytes], user_prompt: str) -> str:
+    """Chấm bài qua Gemini API: Key Rotation + Model Fallback + Optimized Images."""
+    if not _rotator or _rotator.total_keys == 0:
+        return "❌ Lỗi: Chưa cấu hình GEMINI_API_KEYS trong file .env"
+
+    # Optimize images (resize + compress) — chạy trong thread pool
+    optimized_images = await asyncio.to_thread(
+        lambda: [_optimize_image(img) for img in image_list]
+    )
+
+    user_content = f"Yêu cầu của giáo viên:\n{user_prompt}\n\nHãy phân tích ảnh bài làm và chấm điểm."
+
+    # Build content: text prompt + optimized images
+    contents = [user_content]
+    for img_bytes in optimized_images:
+        contents.append(
+            types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+        )
+
+    # Model fallback chain
+    models_to_try = [config.GEMINI_MODEL, "gemini-2.0-flash", "gemini-2.0-flash-lite"]
+    seen = set()
+    models_to_try = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
+
+    for model_name in models_to_try:
+        gen_config = _build_gen_config(model_name)
+        max_retries = _rotator.total_keys * 2
+        attempt = 0
+
+        while attempt < max_retries:
+            api_key = _rotator.get_next_key()
+            if not api_key:
+                break
+
+            wait_time = _rotator.get_wait_time()
+            if wait_time > 0:
+                logging.info(f"⏳ Tất cả key cooldown. Chờ {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+
+            attempt += 1
+            key_hint = f"...{api_key[-6:]}"
             try:
-                model = genai.GenerativeModel(model_name)
-                response = await asyncio.to_thread(model.generate_content, full_prompt)
+                logging.info(f"🔄 Key {key_hint} | {model_name} (thử {attempt}/{max_retries})")
+
+                client = genai.Client(api_key=api_key)
+                start_time = time.time()
+
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=contents,
+                    config=gen_config,
+                )
+                elapsed = time.time() - start_time
+
                 if response.text:
-                    return response.text.strip()
-            except:
+                    result = response.text.strip()
+                    logging.info(f"✅ OK! {model_name} key {key_hint} ({elapsed:.1f}s)")
+                    return result
+
+                logging.warning(f"⚠️ Key {key_hint} trả về rỗng.")
+
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    cooldown_secs = _parse_retry_delay(error_str)
+                    _rotator.mark_cooldown(api_key, cooldown_secs)
+                    logging.warning(f"⏳ Key {key_hint} rate-limited trên {model_name}. Cooldown {cooldown_secs:.0f}s")
+                    continue
+                logging.error(f"❌ Key {key_hint} {model_name}: {error_str[:200]}")
                 continue
-    raise Exception("Không thể chấm qua cả CLI và SDK.")
+
+        logging.warning(f"⚠️ {model_name} thất bại. Thử model tiếp...")
+
+    return "❌ Toàn bộ API key và model đều bị rate limit. Vui lòng thử lại sau vài phút!"
+
+
+def _parse_retry_delay(error_str: str) -> float:
+    """Extract retryDelay from Gemini 429 error. Fallback 15s."""
+    match = re.search(r"retryDelay['\"]:\s*['\"](\d+)", error_str)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"retry in (\d+\.?\d*)", error_str, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return 15.0

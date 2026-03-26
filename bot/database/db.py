@@ -1,3 +1,4 @@
+from typing import Optional
 import aiosqlite
 
 DB_PATH = "bot_data.db"
@@ -20,7 +21,7 @@ async def set_prompt(user_id: int, prompt: str):
         ''', (user_id, prompt))
         await db.commit()
 
-async def get_prompt(user_id: int) -> str | None:
+async def get_prompt(user_id: int) -> Optional[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT prompt FROM users WHERE user_id = ?', (user_id,)) as cursor:
             row = await cursor.fetchone()

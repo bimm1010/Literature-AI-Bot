@@ -13,8 +13,8 @@ router = Router()
 # Lưu trữ tạm thời cho Media Groups (Album ảnh)
 # media_group_id -> [photo_bytes, ...]
 # media_group_id -> [photo.file_id, ...]
-_media_groups: dict[str, list[str]] = {}
-_media_group_timers: dict[str, asyncio.Task] = {}
+_media_groups = {}  # type: dict
+_media_group_timers = {}  # type: dict
 
 @router.message(F.photo)
 async def handle_photo(message: Message):
@@ -87,18 +87,15 @@ async def _wait_and_process_group(message: Message, group_id: str, prompt: str):
 
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id, interval=4.0):
             total = len(file_ids)
-            wait_msg = await message.reply(f"⏳ Đã gom đủ {total} trang bài làm. Đang tải ảnh...")
+            wait_msg = await message.reply(f"⏳ Đã gom đủ {total} trang bài làm. Đang tải ảnh song song...")
             
             try:
-                # Tải toàn bộ ảnh
-                images_data = []
-                for idx, f_id in enumerate(file_ids):
-                    await wait_msg.edit_text(f"⏳ Đang tải ảnh {idx+1}/{total} (Bot đang 'typing' để bạn yên tâm)...")
-                    img = await _download_with_retry(message.bot, f_id)
-                    images_data.append(img)
+                # Tải toàn bộ ảnh SONG SONG (nhanh hơn 2-3x)
+                download_tasks = [_download_with_retry(message.bot, f_id) for f_id in file_ids]
+                images_data = await asyncio.gather(*download_tasks)
                 
-                await wait_msg.edit_text(f"⏳ Đang tiến hành chấm {total} trang bài làm... (Sẽ mất khoảng 30-60s)")
-                result = await ai_service.grade_literature_test(images_data, prompt)
+                await wait_msg.edit_text(f"⏳ Đang chấm {total} trang bài làm...")
+                result = await ai_service.grade_literature_test(list(images_data), prompt)
                 await _send_long_message(message, result)
                 await wait_msg.delete()
             except Exception as e:

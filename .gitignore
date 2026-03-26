@@ -27,6 +27,10 @@ brain/
 !README.md
 !DEPLOY.md
 
+# Database
+*.db
+bot_data.db
+
 # Virtual Environments
 venv/
 ENV/
